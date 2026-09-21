@@ -23,6 +23,10 @@ Semantics
   longer than gap_timeout_seconds is declared 断档: a gap row is recorded,
   next_expected jumps past the hole, and buffered records drain.
 
+Every first-time transition to `committed` (direct commit or buffered drain)
+feeds the device's alert rules in ascending seq order, and declaring a gap
+breaks their consecutive runs (see alerts.py).
+
 All public methods must be called inside a write transaction (db.write_txn),
 so concurrent batches for the same device serialize through SQLite.
 """
@@ -30,6 +34,8 @@ from __future__ import annotations
 
 import time
 from typing import Iterable, Optional
+
+from .alerts import AlertEngine
 
 # Per-record ingest outcomes returned to the caller.
 COMMITTED = "committed"
@@ -62,6 +68,7 @@ class WindowEngine:
         self.conn = conn
         self.window_size = window_size
         self.gap_timeout = gap_timeout_seconds
+        self.alerter = AlertEngine(conn)
 
     # ------------------------------------------------------------------ #
     # device row helpers
@@ -130,6 +137,7 @@ class WindowEngine:
 
         if seq == next_expected:
             self._insert_record(device_id, seq, payload_json, "committed", now)
+            self.alerter.on_committed(device_id, seq, payload_json, now)
             self._advance(device_id, now, start=seq + 1)
             return COMMITTED
 
@@ -201,7 +209,7 @@ class WindowEngine:
         ne = start if start is not None else dev["next_expected"]
         while True:
             row = self.conn.execute(
-                "SELECT status FROM records WHERE device_id = ? AND seq = ?",
+                "SELECT status, payload FROM records WHERE device_id = ? AND seq = ?",
                 (device_id, ne),
             ).fetchone()
             if row is None:
@@ -211,6 +219,8 @@ class WindowEngine:
                     "UPDATE records SET status = 'committed' WHERE device_id = ? AND seq = ?",
                     (device_id, ne),
                 )
+                # First-time commit: advance alert rules with this record too.
+                self.alerter.on_committed(device_id, ne, row["payload"], now)
                 ne += 1
             elif row["status"] in ("committed", "gap_filled"):
                 ne += 1  # already delivered (possible after a rebase)
@@ -271,6 +281,8 @@ class WindowEngine:
                 "detected_at, updated_at) VALUES (?, ?, ?, 'open', 0, ?, ?)",
                 (device_id, dev["next_expected"], row["seq"] - 1, gap_since, now),
             )
+            # The hole will never be committed, so it breaks every alert run.
+            self.alerter.on_gap_declared(device_id, now)
             self.conn.execute(
                 "UPDATE devices SET next_expected = ?, gap_since = NULL, updated_at = ? "
                 "WHERE device_id = ?",

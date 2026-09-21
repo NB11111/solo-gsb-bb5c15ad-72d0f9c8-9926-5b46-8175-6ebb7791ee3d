@@ -10,15 +10,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 
+from .alerts import AlertEngine
 from .config import Settings
 from .cursor import Cursor, CursorError, decode_cursor, encode_cursor
 from .db import connect, init_db, write_txn
 from .models import (
+    AlertList,
+    AlertRuleIn,
+    AlertRuleList,
+    AlertRuleOut,
     BatchIn,
     BatchResponse,
     RecordOut,
@@ -59,7 +66,8 @@ def create_app(settings: Settings) -> FastAPI:
         title="Device Telemetry Ingest API",
         version="1.0.0",
         description="Local telemetry receiver with per-device sliding-window "
-        "ordering, idempotent dedup, gap (断档) detection and replay.",
+        "ordering, idempotent dedup, gap (断档) detection and replay, and "
+        "consecutive-threshold alerting on committed records.",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -289,6 +297,44 @@ def create_app(settings: Settings) -> FastAPI:
         if result is None:
             raise HTTPException(status_code=404, detail=f"gap {gap_id} not found for {device_id}")
         return result
+
+    # -------------------------------------------------------------- #
+    # consecutive-threshold alerting
+    # -------------------------------------------------------------- #
+    @app.post(
+        f"{API_PREFIX}/devices/{{device_id}}/alert-rules",
+        response_model=AlertRuleOut,
+        status_code=201,
+    )
+    def create_alert_rule(device_id: str, rule: AlertRuleIn, conn=Depends(get_conn)):
+        """Create a consecutive-threshold alert rule for a device.
+
+        The device does not need to exist yet (devices are created lazily by
+        their first batch); the rule evaluates records as they turn committed
+        from this moment on — already-committed history is not backfilled.
+        """
+        if not math.isfinite(rule.threshold):
+            raise HTTPException(status_code=422, detail="threshold must be a finite number")
+        with write_txn(conn):
+            return AlertEngine(conn).create_rule(
+                device_id, rule.field, rule.op, rule.threshold, rule.consecutive
+            )
+
+    @app.get(f"{API_PREFIX}/devices/{{device_id}}/alert-rules", response_model=AlertRuleList)
+    def list_alert_rules(device_id: str, conn=Depends(get_conn)):
+        return AlertRuleList(
+            device_id=device_id, rules=AlertEngine(conn).list_rules(device_id)
+        )
+
+    @app.get(f"{API_PREFIX}/devices/{{device_id}}/alerts", response_model=AlertList)
+    def list_alerts(
+        device_id: str,
+        rule_id: Optional[int] = Query(default=None, ge=1),
+        conn=Depends(get_conn),
+    ):
+        return AlertList(
+            device_id=device_id, alerts=AlertEngine(conn).list_alerts(device_id, rule_id)
+        )
 
     return app
 

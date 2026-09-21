@@ -1,6 +1,6 @@
 # 设备遥测接收 API（device-telemetry-ingest）
 
-基于 **FastAPI + SQLite** 的本地设备遥测接收服务。设备按批次上报带递增序列号的遥测记录，批次可能乱序到达；服务为每台设备维护一个**滑动窗口**，实现乱序暂存、重复幂等丢弃、超时断档标记与断档重放，并在并发请求下保持状态一致。
+基于 **FastAPI + SQLite** 的本地设备遥测接收服务。设备按批次上报带递增序列号的遥测记录，批次可能乱序到达；服务为每台设备维护一个**滑动窗口**，实现乱序暂存、重复幂等丢弃、超时断档标记与断档重放，并在并发请求下保持状态一致。另支持**连续阈值告警**：按设备配置规则，对已提交记录按序检测连续越限并生成可查询告警。
 
 ## 快速启动
 
@@ -62,9 +62,18 @@ SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过�
 **断档重放**：客户端查询断档 → 调用重放接口（状态转 `replaying`，返回缺失序列号区间）
 → 设备通过正常批次接口重发缺失序列号 → 逐条落为 `gap_filled` → 缺口全部补齐后断档自动转为 `recovered`。
 
+**连续阈值告警**：每台设备可配置多条告警规则（payload 顶层数值字段 + `gt`/`lt` + 阈值 +
+连续条数 N）。规则只在记录**首次转为 `committed`** 时按 seq 顺序推进——直接提交与一次提交
+冲刷多条 `buffered` 记录都会逐条计算；`duplicate`/`stale`/`out_of_window`/`gap_filled`
+不参与计数，因此重复批次不会重复计数，断档补录也不回溯重算。遇到**声明断档**或**字段缺失/
+非数值**时连续计数中断（streak 清零并重新待命）。连续越限首次达到 N 条时生成一条告警，
+同一连续区段不再重复生成；待计数中断（恢复正常）后，下一段连续越限才会再次触发。
+规则创建前已提交的历史记录不回溯计算。
+
 **并发一致性**：每请求一个 SQLite 连接（WAL 模式 + `busy_timeout`），所有状态变更包裹在
 `BEGIN IMMEDIATE` 写事务中，写操作在数据库层面串行化；同步端点运行在线程池中，
-配合每序列号幂等，并发/重试/乱序下状态保持一致。
+配合每序列号幂等，并发/重试/乱序下状态保持一致。告警状态与产生它的记录状态变更
+在同一事务内提交。
 
 ## API 一览
 
@@ -170,6 +179,78 @@ POST /api/v1/devices/{device_id}/gaps/{gap_id}/replay
 
 设备随后经 `POST /api/v1/batches` 重发缺失序列号即可补齐。
 
+### 创建告警规则
+
+```
+POST /api/v1/devices/{device_id}/alert-rules
+```
+
+```json
+{
+  "field": "temp",
+  "op": "gt",
+  "threshold": 30.0,
+  "consecutive": 3
+}
+```
+
+`field` 为 payload 顶层数值字段名；`op` 取 `gt`（大于阈值越限）或 `lt`（小于阈值越限）；
+`consecutive` 为触发告警所需的连续越限条数 N（≥ 1）。设备不存在也可先建规则
+（设备由首个批次惰性创建），规则只评估创建之后新提交的记录。返回 `201`：
+
+```json
+{
+  "rule_id": 1,
+  "device_id": "dev-001",
+  "field": "temp",
+  "op": "gt",
+  "threshold": 30.0,
+  "consecutive": 3,
+  "created_at": 1758000000.12,
+  "state": {"last_seq": null, "streak": 0, "alerted": false}
+}
+```
+
+### 告警规则列表
+
+```
+GET /api/v1/devices/{device_id}/alert-rules
+```
+
+返回该设备全部规则及实时状态：`streak`（当前连续越限条数）、`alerted`
+（当前连续区段是否已触发告警）、`last_seq`（最近参与计算的 committed 序列号）。
+
+### 查询告警
+
+```
+GET /api/v1/devices/{device_id}/alerts
+GET /api/v1/devices/{device_id}/alerts?rule_id=1
+```
+
+`rule_id` 可选过滤。每条告警记录越限区段的 `start_seq`/`end_seq`（end 为达到连续条数
+的那条记录）、触发值 `trigger_value` 及规则快照（field/op/threshold/consecutive）：
+
+```json
+{
+  "device_id": "dev-001",
+  "alerts": [
+    {
+      "alert_id": 1,
+      "rule_id": 1,
+      "device_id": "dev-001",
+      "field": "temp",
+      "op": "gt",
+      "threshold": 30.0,
+      "consecutive": 3,
+      "start_seq": 1,
+      "end_seq": 3,
+      "trigger_value": 33.0,
+      "created_at": 1758000000.34
+    }
+  ]
+}
+```
+
 ### 其他
 
 - `GET /api/v1/devices` — 设备列表
@@ -211,6 +292,25 @@ curl 'localhost:8000/api/v1/devices/dev-001/records?seq_from=1&seq_to=100&limit=
 # 7. 后续页只带 cursor；期间新到的批次/补录不会混入本次结果
 curl 'localhost:8000/api/v1/devices/dev-001/records?cursor=eyJ2Ijox...'
 # -> 翻页直至 next_cursor 为 null，区间内每条记录恰好返回一次
+
+# 8. 创建连续阈值告警规则：temp 连续 3 条 > 30 触发
+curl -X POST localhost:8000/api/v1/devices/dev-001/alert-rules \
+  -H 'Content-Type: application/json' \
+  -d '{"field":"temp","op":"gt","threshold":30,"consecutive":3}'
+# -> 201 {"rule_id": 1, ..., "state": {"streak": 0, "alerted": false}}
+
+# 9. 上报连续越限数据；达到 3 条时生成一条告警
+curl -X POST localhost:8000/api/v1/batches -H 'Content-Type: application/json' -d '{
+  "device_id": "dev-001",
+  "records": [{"seq":7,"payload":{"temp":31}},{"seq":8,"payload":{"temp":32}},
+              {"seq":9,"payload":{"temp":33}}]
+}'
+curl localhost:8000/api/v1/devices/dev-001/alerts
+# -> alerts[0]: start_seq=7, end_seq=9, trigger_value=33.0
+#    同一连续区段不再重复告警；恢复正常（未越限/字段缺失/声明断档）后才可再次触发
+
+# 10. 查看规则实时状态（streak/alerted）
+curl localhost:8000/api/v1/devices/dev-001/alert-rules
 ```
 
 ## 项目结构
@@ -220,12 +320,14 @@ app/
   config.py   # 环境变量配置
   db.py       # SQLite 连接、建表、写事务（WAL + BEGIN IMMEDIATE）
   window.py   # 滑动窗口核心引擎（提交/暂存/断档/重放/回锚）
+  alerts.py   # 连续阈值告警引擎（规则推进/断档中断/告警生成）
   cursor.py   # HMAC 签名的不透明分页游标（高水位 + 键集位置）
   models.py   # 请求/响应模型
   main.py     # FastAPI 应用、路由、后台断档扫描器
 tests/
   test_api.py     # 乱序/幂等/断档/重放/回锚/并发一致性测试
   test_records.py # 一致性分页：快照隔离/游标篡改/跨设备/区间变更测试
+  test_alerts.py  # 连续阈值告警：规则 CRUD/连续计数/断档中断/补录不重算测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
@@ -243,3 +345,7 @@ pytest tests/ -q
 8 线程并发提交 200 条记录后的状态一致性校验（真实 uvicorn 服务），
 以及一致性分页：多页不重不漏、翻页期间新批次/断档补录不混入、原地状态变更不漏读、
 游标篡改/跨设备/更改区间复用均返回 400。
+连续阈值告警：规则创建/校验/列表、gt/lt 越限判定、首次达 N 条生成告警且同区段不重复、
+恢复正常后再次触发、字段缺失/非数值中断计数、buffered 冲刷逐条按序计算、
+重复批次不重复计数、stale/out_of_window 不参与、声明断档中断连续计数、
+断档补录不回溯重算、规则创建前历史不回溯、多规则独立评估。

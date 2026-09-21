@@ -42,6 +42,40 @@ CREATE TABLE IF NOT EXISTS gaps (
     updated_at   REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_gaps_device ON gaps(device_id, status);
+
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id   TEXT NOT NULL,
+    field       TEXT NOT NULL,              -- top-level payload key to inspect
+    op          TEXT NOT NULL CHECK (op IN ('gt', 'lt')),
+    threshold   REAL NOT NULL,
+    consecutive INTEGER NOT NULL CHECK (consecutive >= 1),
+    created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_rules_device ON alert_rules(device_id);
+
+CREATE TABLE IF NOT EXISTS alert_rule_state (
+    rule_id    INTEGER PRIMARY KEY REFERENCES alert_rules (id) ON DELETE CASCADE,
+    last_seq   INTEGER,                     -- last committed seq evaluated (NULL = none yet)
+    streak     INTEGER NOT NULL DEFAULT 0,  -- current run of consecutive violations
+    alerted    INTEGER NOT NULL DEFAULT 0,  -- 1 while the current run has fired its alert
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id       INTEGER NOT NULL REFERENCES alert_rules (id) ON DELETE CASCADE,
+    device_id     TEXT NOT NULL,
+    field         TEXT NOT NULL,            -- rule snapshot, so alerts survive rule changes
+    op            TEXT NOT NULL,
+    threshold     REAL NOT NULL,
+    consecutive   INTEGER NOT NULL,
+    start_seq     INTEGER NOT NULL,         -- first seq of the violating run
+    end_seq       INTEGER NOT NULL,         -- seq at which the run reached `consecutive`
+    trigger_value REAL NOT NULL,            -- field value of the triggering record
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_device ON alerts(device_id, id);
 """
 
 
