@@ -12,6 +12,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 
@@ -19,11 +20,18 @@ from .config import Settings
 from .cursor import Cursor, CursorError, decode_cursor, encode_cursor
 from .db import connect, init_db, write_txn
 from .models import (
+    AlertList,
+    AlertOut,
     BatchIn,
     BatchResponse,
+    DeviceAlertList,
+    DeviceRuleList,
     RecordOut,
     RecordPage,
     RecordResult,
+    RuleCreate,
+    RuleList,
+    RuleOut,
     WindowSummary,
 )
 from .window import WindowEngine
@@ -36,6 +44,9 @@ API_PREFIX = "/api/v1"
 # page falls back to the default and the cursor pins it for later pages).
 RECORDS_DEFAULT_LIMIT = 100
 RECORDS_MAX_LIMIT = 1000
+
+ALERTS_DEFAULT_LIMIT = 100
+ALERTS_MAX_LIMIT = 1000
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -59,7 +70,8 @@ def create_app(settings: Settings) -> FastAPI:
         title="Device Telemetry Ingest API",
         version="1.0.0",
         description="Local telemetry receiver with per-device sliding-window "
-        "ordering, idempotent dedup, gap (断档) detection and replay.",
+        "ordering, idempotent dedup, gap (断档) detection and replay, plus "
+        "consecutive-threshold alerting on top-level payload fields.",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -289,6 +301,79 @@ def create_app(settings: Settings) -> FastAPI:
         if result is None:
             raise HTTPException(status_code=404, detail=f"gap {gap_id} not found for {device_id}")
         return result
+
+    # -------------------------------------------------------------- #
+    # consecutive-threshold alert rules & alerts
+    # -------------------------------------------------------------- #
+    @app.post(
+        f"{API_PREFIX}/devices/{{device_id}}/alert-rules",
+        response_model=RuleOut,
+        status_code=201,
+    )
+    def create_alert_rule(device_id: str, rule_in: RuleCreate, conn=Depends(get_conn)):
+        """Create a per-device consecutive-threshold rule.
+
+        Rules may be created before the device ever sends data; they only
+        advance on records committing afterwards (historical records are
+        not back-evaluated).
+        """
+        with write_txn(conn):
+            return engine(conn).alerts.create_rule(
+                device_id=device_id,
+                field=rule_in.field,
+                op=rule_in.op,
+                threshold=rule_in.threshold,
+                consecutive_count=rule_in.consecutive_count,
+            )
+
+    @app.get(
+        f"{API_PREFIX}/devices/{{device_id}}/alert-rules",
+        response_model=DeviceRuleList,
+    )
+    def list_device_alert_rules(device_id: str, conn=Depends(get_conn)):
+        return {
+            "device_id": device_id,
+            "rules": engine(conn).alerts.list_rules(device_id),
+        }
+
+    @app.get(f"{API_PREFIX}/alert-rules", response_model=RuleList)
+    def list_all_alert_rules(conn=Depends(get_conn)):
+        return {"rules": engine(conn).alerts.list_rules(None)}
+
+    @app.get(f"{API_PREFIX}/alerts", response_model=AlertList)
+    def list_alerts(
+        device_id: Optional[str] = Query(default=None, max_length=128),
+        rule_id: Optional[int] = Query(default=None, ge=1),
+        limit: int = Query(default=ALERTS_DEFAULT_LIMIT, ge=1, le=ALERTS_MAX_LIMIT),
+        after_id: Optional[int] = Query(default=None, ge=1),
+        conn=Depends(get_conn),
+    ):
+        """List generated alerts, ascending by id (creation order).
+
+        Filters are optional: no filter lists every device's alerts;
+        ``device_id`` may be combined with ``rule_id``. ``after_id`` gives
+        simple keyset polling (pass the largest alert_id already seen).
+        """
+        alerts = engine(conn).alerts.list_alerts(
+            device_id=device_id, rule_id=rule_id, limit=limit, after_id=after_id
+        )
+        return {"alerts": [AlertOut(**a) for a in alerts]}
+
+    @app.get(
+        f"{API_PREFIX}/devices/{{device_id}}/alerts",
+        response_model=DeviceAlertList,
+    )
+    def list_device_alerts(
+        device_id: str,
+        rule_id: Optional[int] = Query(default=None, ge=1),
+        limit: int = Query(default=ALERTS_DEFAULT_LIMIT, ge=1, le=ALERTS_MAX_LIMIT),
+        after_id: Optional[int] = Query(default=None, ge=1),
+        conn=Depends(get_conn),
+    ):
+        alerts = engine(conn).alerts.list_alerts(
+            device_id=device_id, rule_id=rule_id, limit=limit, after_id=after_id
+        )
+        return {"device_id": device_id, "alerts": [AlertOut(**a) for a in alerts]}
 
     return app
 

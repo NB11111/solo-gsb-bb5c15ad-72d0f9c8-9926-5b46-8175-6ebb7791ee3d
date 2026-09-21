@@ -31,6 +31,8 @@ from __future__ import annotations
 import time
 from typing import Iterable, Optional
 
+from .alerts import AlertEngine
+
 # Per-record ingest outcomes returned to the caller.
 COMMITTED = "committed"
 BUFFERED = "buffered"
@@ -62,6 +64,7 @@ class WindowEngine:
         self.conn = conn
         self.window_size = window_size
         self.gap_timeout = gap_timeout_seconds
+        self.alerts = AlertEngine(conn)
 
     # ------------------------------------------------------------------ #
     # device row helpers
@@ -109,6 +112,13 @@ class WindowEngine:
         for seq, payload_json in items:
             dev = self._get_device(device_id)  # state may move every record
             results.append({"seq": seq, "status": self._ingest(dev, seq, payload_json, now)})
+
+        # One frontier walk per batch covers every record that transitioned
+        # to committed here (in-order records and buffered drains alike),
+        # in strict seq order; an in-order batch otherwise stops calling
+        # the commit path after its first record (later seqs already exist).
+        if any(r["status"] == COMMITTED for r in results):
+            self.alerts.advance_device(device_id)
         return results
 
     def _ingest(self, dev, seq: int, payload_json: str, now: float) -> str:
@@ -160,7 +170,13 @@ class WindowEngine:
             # Below the window, never recorded, not part of any declared gap.
             if self._can_rebase(device_id, seq):
                 # Window was anchored too high (racing first batches); pull
-                # the start down and ingest normally.
+                # the start down and ingest normally. This is NOT a 断档:
+                # the incoming record is genuinely contiguous data. The
+                # alert frontier walk (after the batch) handles it in seq
+                # order -- it extends the walk when the prefix is still
+                # open, and a rebase below an already-walked frontier is
+                # simply not re-evaluated without breaking the run, since
+                # no gap was ever declared.
                 self.conn.execute(
                     "UPDATE devices SET next_expected = ?, updated_at = ? WHERE device_id = ?",
                     (seq, now, device_id),
@@ -196,6 +212,10 @@ class WindowEngine:
 
         `start` overrides the scan origin: after committing seq N the scan
         begins at N+1; after a gap jump it begins at the new next_expected.
+        Alert evaluation is the caller's responsibility (advance_device),
+        driven by the per-device frontier so records are always walked in
+        ascending seq order, regardless of which transaction committed
+        them.
         """
         dev = self._get_device(device_id)
         ne = start if start is not None else dev["next_expected"]
@@ -277,6 +297,12 @@ class WindowEngine:
                 (row["seq"], now, device_id),
             )
             self._advance(device_id, now)
+            # The declared 断档 interrupts every alert run; the frontier
+            # jumps past the hole and then walks the buffered records that
+            # just drained, which start brand-new runs. Late gap
+            # backfills (gap_filled) are never walked, so the old run is
+            # neither resumed nor recomputed.
+            self.alerts.advance_device(device_id, jump_to=row["seq"])
             dev = self._get_device(device_id)  # loop: a further gap may also be expired
 
     def sweep_all_devices(self) -> int:
